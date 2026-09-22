@@ -93,7 +93,11 @@ emit_lines | grep -q "Set-Content" && bad "用了 Set-Content（PS 5.1 会写 BO
 # 参数面与 join.sh 对齐
 for p in "\$Name" "\$Notify" "\$Out" "\$CredFile" "\$Split" "\$Print" \
          "\$StatusOnly" "\$Offline" "\$SelfTest"; do
-  grep -q -- "\[string\]${p}\|\[switch\]${p}" "$JOINPS" && ok "参数 ${p} 已声明" \
+  # 用 -e 多模式而非 "\|" 交替：后者不是 POSIX BRE 的一部分，GNU grep 与
+  # macOS 的 BSD grep 认，但精简实现（如 toybox grep）不认 —— 一旦不认，
+  # 这 9 项断言会凭空失败，反过来看第 181/314 行那种「不得命中」的断言还会
+  # 静默变成永远通过（假安全）。全项目统一用 -e。
+  grep -q -e "\[string\]${p}" -e "\[switch\]${p}" "$JOINPS" && ok "参数 ${p} 已声明" \
     || bad "参数 ${p} 未声明"
 done
 
@@ -178,7 +182,7 @@ WB_CRED_FILE="$PROBE/cred.json" "$PWSH" -NoProfile -File "$JOINPS" \
 RC=$?
 [ "$RC" = "0" ] && ok "join.ps1 退出码 0" || { bad "join.ps1 退出码 $RC"; sed 's/^/    /' "$WLOG"; }
 grep -q "凭据校验通过" "$WLOG" && ok "调接口校验了凭据（HTTP 200）" || bad "没做凭据校验"
-grep -q "WINSECRET\|$FAKE_TOKEN\|$FAKE_UID" "$WLOG" \
+grep -q -e "WINSECRET" -e "$FAKE_TOKEN" -e "$FAKE_UID" "$WLOG" \
   && bad "屏幕输出里泄露了凭据或机器人地址" || ok "输出无凭据、无机器人令牌、无 uid"
 grep -q "^Authorization: Bearer $FAKE_TOKEN$" "$PROBE/stub_headers.txt" 2>/dev/null \
   && ok "真的把 Authorization 头发对了" || bad "Authorization 头不对"
@@ -311,7 +315,7 @@ RC=$?
 [ "$RC" != "0" ] && ok "登录态缺失时退出码非 0" || bad "登录态缺失竟然成功"
 grep -q "读不到本机登录态" "$PROBE/wnocred.log" && ok "给出的是可读的中文提示" \
   || bad "没有可读提示"
-grep -qi "At line\|CategoryInfo\|FullyQualifiedErrorId" "$PROBE/wnocred.log" \
+grep -qi -e "At line" -e "CategoryInfo" -e "FullyQualifiedErrorId" "$PROBE/wnocred.log" \
   && bad "输出里有 PowerShell 堆栈（应给人话）" || ok "输出里没有原始堆栈"
 
 # 登录态是坏 JSON 时同样要给人话

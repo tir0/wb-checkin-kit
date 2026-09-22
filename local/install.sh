@@ -222,5 +222,5 @@ say "  手动同步一次   bash $INSTALLED_SCRIPT --force   （--force 绕过�
 say "  任务状态       launchctl print gui/$UID_NUM/$LABEL | grep -E 'state|last exit'"
 say "  卸载           bash \"$SELF_DIR/install.sh\" --uninstall"
 say ""
-say "注意：你的 ~/Documents/GitHub/wb-checkin 工作副本不会自动跟随"
-say "      （launchd 无权访问 ~/Documents），需要时自己 git pull 即可。"
+say "注意：你 clone 出来的这个工作副本不会自动跟随云端提交"
+say "      （launchd 无权访问 ~/Documents 等目录），需要时自己 git pull 即可。"

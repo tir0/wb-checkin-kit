@@ -169,6 +169,28 @@ def main():
                   for m in re.finditer(r"(?<!\{)\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7f])", src)]
     check("无 $VAR 紧贴全角字符的写法", not risky, str(risky) if risky else "")
 
+    # 真实踩过的坑（2026-09-22）：grep 的 "\|" 交替并不是 POSIX BRE 的一部分。
+    # GNU grep 与 macOS 的 BSD grep 恰好都认，但精简实现（例如 WorkBuddy 沙箱里
+    # 注入的 toybox grep）不认 —— 不认时不只是「应命中」的断言会凭空失败，更糟的是
+    # 「不得命中」的安全断言（如「输出里没有凭据 / 没有原始堆栈」）会静默变成永远
+    # 通过，给出假安全。统一改用 grep -q -e A -e B 这种 POSIX 多模式写法。
+    altern = []
+    # 扫目录而不是列固定文件名：以后新增脚本自动被纳入，不用回来改测试
+    scan_targets = [".github/workflows/wb-checkin.yml"]
+    for sub, exts in (("local", (".sh", ".ps1")), ("tests", (".sh",))):
+        d = os.path.join(REPO, sub)
+        if os.path.isdir(d):
+            scan_targets += [os.path.join(sub, f)
+                             for f in sorted(os.listdir(d)) if f.endswith(exts)]
+    for rel in scan_targets:
+        p = os.path.join(REPO, rel)
+        if not os.path.isfile(p):
+            continue
+        if re.search(r"grep[^\n]*\\\|", read(p)):
+            altern.append(rel)
+    check("grep 未使用 \\| 交替（改用 POSIX 的 -e 多模式）",
+          not altern, str(sorted(set(altern))) if altern else "")
+
     # 真实踩过的坑（2026-09-20）：远端快照的哈希用 `jq -r '"\(a)\n\(b)"'`
     # 直接接 shasum，jq 会补一个尾部换行；而本地用 printf '%s\n%s'（无尾部
     # 换行）。两者永不相等 → 每轮都误判「未同步」而重复推送。
