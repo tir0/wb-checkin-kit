@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  WorkBuddy 凭据同步器 —— launchd 用户级任务模板
+  占位符由 local/install.sh 替换后写入 ~/Library/LaunchAgents/，请勿直接使用本文件。
+
+  三重触发，确保「桌面端一换发凭据，仓库里就跟着更新」：
+    RunAtLoad     登录后立即同步一次
+    WatchPaths    凭据文件被改写时立即触发（换发即刻生效）
+    StartInterval 每 30 分钟兜底一次（WatchPaths 在个别情况下可能漏事件）
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.wb-checkin-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SCRIPT_PATH__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>WatchPaths</key>
+    <array>
+        <string>__CRED_FILE__</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__STATE_DIR__/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__STATE_DIR__/launchd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 多账号驱动每次运行落下的逐行结果（工作流「记录结果」步骤读它），
+# 属于一次性的运行时产物，不入库。
+logs/last_run.tsv
+
+# 注意：state/credentials.enc 与 state/peers/*.enc 是「本机 → 云端」的加密
+# 凭据快照，必须入库（工作流要读它），不要在 .gitignore 里排除。
+# 它们是 AES-256-CBC 密文，密钥只在各人的 ~/.wb-checkin/key（或分享文件）
+# 与仓库 Secret WB_TOKEN_KEY / WB_PEER_KEYS 中。

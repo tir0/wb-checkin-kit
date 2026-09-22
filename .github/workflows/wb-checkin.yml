@@ -1,0 +1,354 @@
+name: WorkBuddy 每日自动签到
+
+# 完全跑在 GitHub 云端，不依赖你的电脑（关机、断网都不影响），
+# 且不经过任何大模型 —— token / 积分消耗恒为 0。
+#
+# ── 架构 ────────────────────────────────────────────────────────────────
+#   Mac（凭据同步器，local/install.sh 装好后常驻）
+#     读 ~/Library/.../workbuddy-desktop.info 里最新的 accessToken
+#     → AES-256-CBC 加密 → 提交到本仓库 state/credentials.enc
+#   本工作流
+#     解密 state/credentials.enc（密钥来自 Secret WB_TOKEN_KEY）
+#     → 用解出的 token 调签到接口
+#
+# ── 多账号（2026-09-22 新增，纯增量，单账号链路未改动）───────────────────
+#   本仓库可以顺带帮别人的账号签到，别人不需要 GitHub、不需要装任何东西：
+#     state/peers/<slug>.enc   每个账号一份加密快照（各自的密钥加密）
+#     Secret WB_PEER_KEYS      所有账号的密钥：{"账号":"64位hex", ...}
+#     local/join.sh            对方在本机跑一次，产出「分享文件」
+#     local/add-peer.sh        仓库主导入分享文件、维护密钥登记簿
+#   一人一钥：某个账号的分享文件泄露，也只能解开他自己那一份快照。
+#   通知：快照里自带各自的机器人地址；没带的用 WB_NOTIFY_WEBHOOK 兜底
+#   （即「同一个机器人」场景）。没配置 state/peers/ 时该步骤安静跳过。
+#
+#   为什么不让别人自己开仓库：对不写代码的人，GitHub 建库 + SSH + Secret
+#   三步都是门槛；放在已有的私有仓库里，对方只需要「跑一条命令 + 把文件发回来」。
+#
+#   为什么不能让凭据「复制一次、长期使用」：副本有保质期。
+#   accessToken 是 JWT，实测 iat→exp 固定 55 天，过期即失效；另外
+#   「凭证格式换代 / 重新登录」会让旧副本立刻作废（2026-09-18 实测：
+#   当时 Secret 里存的是旧式不透明串，凭据文件换成 JWT 后那份副本返回
+#   401 invalid_token）。所以必须有一个读源文件的环节持续同步。
+#
+#   ⚠️ 与早期结论的差异：日常换发**不会**吊销旧 token。
+#   2026-09-21 实测把 state/credentials.enc 的全部历史版本逐个解密打接口，
+#   横跨 9-18 → 9-21 的 8 份快照全部返回 HTTP 200。因此
+#   ① 同步器不必每次换发都推（local/ 里加了推送节流）；
+#   ② 本机离线数周云端仍能正常签到，前提是快照的 JWT 没过 exp。
+#
+# ── 维护备忘（踩过的坑，别改回去）────────────────────────────────────────
+#   1. 调度时间用 UTC。GitHub 文档里的 timezone 字段是版本门控特性，
+#      并非所有环境支持；写错会导致整个工作流无法触发，故坚持 UTC 硬转换。
+#      UTC 20:17 = 北京时间次日 04:17。
+#   2. 刻意避开整点（:00）与半点（:30）。GitHub 官方文档原文：
+#      "The schedule event can be delayed during periods of high loads...
+#       High load times include the start of every hour. If the load is
+#       sufficiently high enough, some queued jobs may be dropped."
+#   3. 【重要】schedule 事件会系统性延迟，官方声明本就是 best-effort。
+#      截至 2026-09-19 的七次实测延迟（见 logs/runs.md）：
+#        09-17  01:17 → 06:10 计划延迟 4h53m
+#        09-18  01:17 → 05:58（4h41m）／05:17 → 09:43（4h26m）／09:17 → 13:39（4h22m）
+#        09-19  01:17 → 05:57（4h40m）／05:17 → 09:28（4h11m）／09:17 → 13:13（3h56m）
+#      全部落在 3h56m~4h53m，高度一致，说明这不是随机抖动，而是该仓库在该
+#      时段的固有排队行为。因此上面三个时点是按「叠加延迟后的落点」倒推
+#      设置的，不能只看 UTC 数字本身。前移后实际执行约为北京时间
+#      08:47 / 12:47 / 16:47。
+#      对「一天只有一次机会」的签到，单一时点不可靠，故挂三个时点互为
+#      补充（签到幂等，重复执行返回 code 10001，无副作用）。
+#   4. 定时任务只在默认分支（main）上生效，改完必须合到 main。
+#   5. 「60 天无活动自动禁用定时任务」仅适用于 public 仓库，
+#      本仓库是 private，不受此规则影响。
+#   6. 凭据失效时怎么办：先在本机看 ~/.wb-checkin/sync.log；
+#      若同步器正常，通常是桌面端重新登录导致 sessionState 变化，
+#      重新运行一次 local/install.sh（或等同步器自动触发）即可。
+#   7. permissions 需要 contents: write，是为了把每次运行结果追加到
+#      logs/runs.md 并提交回仓库 —— 这样「今天到底跑没跑」可以直接在
+#      仓库里查到，不必登录 Actions 页面翻日志。
+#   8. 【重要】logs/runs.md 的提交与本机凭据同步器的提交会互相撞车，
+#      导致「签到成功但记录丢失」。2026-09-20 实测过一次：本机在
+#      01:51~02:08 UTC 连续推了 5 个凭据快照，工作流那次的 push 被拒，
+#      而该步骤设了 continue-on-error，失败被静默吞掉。
+#      故记录步骤改为「推送失败则 fetch + rebase 后重试 5 次」，
+#      并且最终失败时会打 ::error:: 注解，不再无声无息。
+#      → 排查「今天为什么没记录」时，先看是不是这类撞车，而不是签到失败。
+#   9. 通知（2026-09-21 接入）：渠道地址首选「随加密快照下发」——本机
+#      ~/.wb-checkin/config 里的 notify_webhook 字段，同步器把它和 token 一起
+#      AES 加密后推上来，本工作流解密时注入 NOTIFY_WEBHOOK。这样不必在 GitHub
+#      上另设一个 Secret，改地址只需改本机配置（只改地址会绕过节流立即生效）。
+#      Secret `WB_NOTIFY_WEBHOOK` 仍受支持且优先级更高（兼容旧部署 / 临时覆盖）。
+#      钉钉若用「自定义关键词」安全设置，消息必须含该关键词 —— 标题固定是
+#      「WorkBuddy 签到：」，把关键词设成「签到」即可，否则钉钉返回
+#      HTTP 200 + errcode 310000（脚本会如实报「被渠道拒收」）。
+#   10. 凭据快照的历史包袱：同步器原本每次 token 换发都提交一次，
+#      几天下来 52 个提交占了总提交量的 66%。2026-09-21 从全部历史中清除了
+#      state/credentials.enc 并只保留最新一份，同时给同步器加了推送节流。
+#      若日后发现提交又被动辄刷屏，先查节流是否失效。
+#   11. 改完 local/ 下的脚本记得在本机重跑 local/install.sh ——
+#      launchd 实际执行的是 ~/.wb-checkin/ 下的副本，不是仓库里的这份。
+#   12. 【多账号】logs/runs.md 的表头 2026-09-22 从 6 列变 8 列（加了账号/
+#      结果/说明）。记录步骤会把老行整体补成 8 列再写新行 —— 只换表头会让
+#      历史行错位、渲染成图时列会串。改这段前先看 tests/test_record_retry.sh
+#      （它直接从本文件抽该步骤来跑，改动会影响它）。
+#   13. 【多账号】为什么让别人的账号挂在本仓库、而不是各人自建一个：门槛
+#      全在 GitHub（建库 / SSH / Secret 三步），对不写代码的人堵死。放这里，
+#      对方只需「跑一条命令 + 把分享文件发回来」。代价是密钥由本仓库保管，
+#      因此坚持一人一钥，且快照里的 token 只有签到权限。
+#   14. 【多账号】新增/移除账号后必须更新 Secret WB_PEER_KEYS，否则新账号
+#      会因缺密钥被跳过（脚本会明确报出来，不会静默漏签）。
+
+on:
+  schedule:
+    # 三个时点整体前移，使「叠加约 4.5h 延迟后的实际执行」落在清晨至午后。
+    # 换算：UTC = 北京时间 - 8h，跨天时向前借一天（故 04:17 北京 = 前一日 20:17 UTC）。
+    - cron: '17 20 * * *'     # 北京时间 04:17（主时点，次日）
+    - cron: '17 0 * * *'      # 北京时间 08:17（兜底 1）
+    - cron: '17 4 * * *'      # 北京时间 12:17（兜底 2）
+  workflow_dispatch: {}       # 手动触发入口，用于验证
+
+permissions:
+  contents: write   # 仅用于把运行记录追加到 logs/runs.md 并提交
+
+# 同一时间只允许一个 run 操作仓库，避免并发提交冲突
+concurrency:
+  group: wb-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # 记录步骤需要 rebase 后推送，浅克隆会失败
+
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # 无论哪种触发方式都先打印来源，便于在 Actions 页面区分
+      # 「schedule 事件到底有没有送达」。
+      - name: 触发来源诊断
+        run: |
+          {
+            echo "### 触发来源"
+            echo "触发事件    : ${{ github.event_name }}"
+            echo "cron 表达式 : ${{ github.event.schedule }}"
+            echo "UTC 时间    : $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo "北京时间    : $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # 用 Secret 里的密钥解开本机同步器推上来的密文快照，注入后续步骤。
+      - name: 解出最新凭据
+        env:
+          WB_TOKEN_KEY: ${{ secrets.WB_TOKEN_KEY }}
+          # 通知地址优先取 Secret（兼容旧部署 / 临时覆盖），没设就用快照里的。
+          SECRET_NOTIFY: ${{ secrets.WB_NOTIFY_WEBHOOK }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WB_TOKEN_KEY:-}" ]; then
+            echo "::error::缺少 Secret WB_TOKEN_KEY —— 把本机 ~/.wb-checkin/key 的内容加为仓库 Secret 后重试。"
+            exit 1
+          fi
+          if [ ! -s state/credentials.enc ]; then
+            echo "::error::仓库里没有 state/credentials.enc —— 请在本机运行 local/install.sh 完成首次同步。"
+            exit 1
+          fi
+
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+                 -in state/credentials.enc -pass env:WB_TOKEN_KEY \
+                 > /tmp/cred.json 2> /tmp/openssl.err; then
+            echo "::error::解密失败：WB_TOKEN_KEY 与加密时使用的密钥不一致，或密文已损坏。"
+            sed 's/^/  /' /tmp/openssl.err || true
+            exit 1
+          fi
+          chmod 600 /tmp/cred.json
+
+          TOK="$(python3 -c 'import json;print(json.load(open("/tmp/cred.json"))["access_token"])')"
+          UIDV="$(python3 -c 'import json;print(json.load(open("/tmp/cred.json"))["uid"])')"
+          SNAP="$(python3 -c 'import json;d=json.load(open("/tmp/cred.json"));print(d.get("synced_at_utc","未知"))')"
+
+          if [ -z "$TOK" ] || [ -z "$UIDV" ]; then
+            echo "::error::密文内容不完整（缺少 access_token 或 uid）。"
+            exit 1
+          fi
+
+          # 显式注册脱敏，避免万一被打印出来时出现在日志里
+          echo "::add-mask::$TOK"
+          echo "::add-mask::$UIDV"
+
+          {
+            echo "WB_ACCESS_TOKEN=$TOK"
+            echo "WB_UID=$UIDV"
+            echo "WB_CRED_SNAPSHOT=$SNAP"
+          } >> "$GITHUB_ENV"
+
+          # 通知渠道地址：优先 Secret（可选），否则用本机同步上来的 notify_webhook。
+          # 放快照里是因为它含机器人令牌、等同密钥 —— 走已有的 AES-256-CBC 通道
+          # 就不必在 GitHub 上再手工维护一个 Secret，改地址只需改本机配置。
+          HOOK=""
+          HOOK_SRC="未配置"
+          if [ -n "${SECRET_NOTIFY:-}" ]; then
+            HOOK="$SECRET_NOTIFY"
+            HOOK_SRC="Secret WB_NOTIFY_WEBHOOK"
+          else
+            HOOK="$(python3 -c 'import json;print(json.load(open("/tmp/cred.json")).get("notify_webhook") or "")')"
+            [ -n "$HOOK" ] && HOOK_SRC="凭据快照（本机 ~/.wb-checkin/config）"
+          fi
+          if [ -n "$HOOK" ]; then
+            # 掩码必须在写入任何日志之前注册：地址里的 access_token 不能出现在运行日志里
+            echo "::add-mask::$HOOK"
+            echo "NOTIFY_WEBHOOK=$HOOK" >> "$GITHUB_ENV"
+          fi
+          {
+            echo ""
+            echo "| 通知渠道 | 值 |"
+            echo "|---|---|"
+            echo "| 状态 | $([ -n "$HOOK" ] && echo '已启用' || echo '未配置（签到不受影响）') |"
+            echo "| 来源 | $HOOK_SRC |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          python3 scripts/cred_summary.py /tmp/cred.json | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -f /tmp/cred.json /tmp/openssl.err
+
+      - name: 执行签到
+        id: checkin
+        # 凭据由上一步通过 GITHUB_ENV 注入（WB_ACCESS_TOKEN / WB_UID）。
+        # set -o pipefail 必不可少：不加的话 tee 的退出码会覆盖脚本的退出码，
+        # 签到失败时任务照样显示绿勾，等于白跑。
+        # tee 到 GITHUB_STEP_SUMMARY，结果直接显示在 Actions 运行页顶部。
+        #
+        # 通知（可选）：脚本读这两个环境变量，未配置时完全静默、零副作用。
+        #   NOTIFY_WEBHOOK     —— 渠道地址，由上一步解密快照后写入 GITHUB_ENV。
+        #     ⚠️ 千万别在这里再声明一次：步骤级 env 的优先级高于 GITHUB_ENV，
+        #     未设 Secret 时会用空值把快照里的地址覆盖掉，通知就永远发不出来。
+        #   NOTIFY_ON_SUCCESS  —— 置 1 则「今天已签到 / 签到成功」也推一条，
+        #                         相当于每日回执；不设则只在需要人工介入时推
+        # 渠道按域名自动适配：钉钉/企业微信群机器人、Server酱、通用 JSON。
+        env:
+          NOTIFY_ON_SUCCESS: '1'
+        run: |
+          set -o pipefail
+          python3 scripts/wb_checkin.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ── 其他账号（多账号模式，2026-09-22 新增）──────────────────────────
+      # 与上面的单账号链路【完全独立】：上面那两步一个字没改，本步骤出问题
+      # 也不会影响仓库主本人的签到。state/peers/ 为空时安静跳过（退出码 0），
+      # 因此未启用多账号的部署升级后行为与从前一致。
+      #
+      # 每个账号一份 state/peers/<slug>.enc，用各自的密钥加密；所有密钥集中
+      # 放在 Secret WB_PEER_KEYS（JSON：{"账号":"64位hex"}）。一人一钥的意义：
+      # 某个账号的分享文件即使泄露，也只能解开他自己那一份快照。
+      #
+      # if: always() —— 账号之间互不拖累：即使仓库主那步失败了，
+      # 朋友的签到照跑（反过来也一样）。
+      - name: 多账号签到
+        if: always()
+        id: peers
+        env:
+          WB_PEER_KEYS: ${{ secrets.WB_PEER_KEYS }}
+          # 没有自带机器人的账号用这个兜底地址（「同一个机器人」场景）。
+          # 刻意用独立变量名：绝不碰单账号链路用的 NOTIFY_WEBHOOK，
+          # 否则会踩「步骤级 env 优先级高于 GITHUB_ENV」那个坑。
+          WB_PEER_NOTIFY_FALLBACK: ${{ secrets.WB_NOTIFY_WEBHOOK }}
+        run: |
+          set -o pipefail
+          python3 scripts/wb_peers.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # 把本次运行追加到 logs/runs.md 并提交回仓库。
+      # 目的：让「今天到底有没有自动跑」可以在仓库里直接查到，
+      # 无需登录 Actions 页面；同时这些提交也算仓库活动。
+      - name: 记录运行结果
+        if: always()
+        continue-on-error: true   # 记录失败不应让整个任务变红
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+
+          # 8 列。多出来的「账号 / 结果 / 说明」是 2026-09-22 引入的多账号维度：
+          # 一行一个账号，仓库主本人固定记为 self。
+          HEADER='| 时间(UTC) | 北京时间 | 账号 | 触发方式 | cron | 结果 | 说明 | 凭据快照 |'
+          SEP='|---|---|---|---|---|---|---|---|'
+
+          if [ ! -f logs/runs.md ]; then
+            printf '%s\n%s\n' "$HEADER" "$SEP" > logs/runs.md
+          elif [ "$(head -1 logs/runs.md)" != "$HEADER" ]; then
+            # 表头变了（老文件是 6 列）。除了换表头，还必须把老行补成 8 列 ——
+            # 只换表头的话所有历史行会整体错位，渲染成图时列会串。
+            # awk 以 | 切分：6 列的行恰好是 8 个字段（首尾各一个空字段）。
+            tail -n +3 logs/runs.md > /tmp/wb_body.txt
+            {
+              printf '%s\n%s\n' "$HEADER" "$SEP"
+              awk -F'|' 'BEGIN{OFS="|"}
+                NF==8 {print $1,$2,$3," - ",$4,$5,$6," - ",$7,$8; next}
+                {print}' /tmp/wb_body.txt
+            } > logs/runs.md
+          fi
+
+          NOW_UTC="$(date -u '+%Y-%m-%d %H:%M:%S')"
+          NOW_CN="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+
+          # 一行一个账号：$1 账号 · $2 结果 · $3 说明 · $4 凭据快照
+          append_row() {
+            printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+              "$NOW_UTC" "$NOW_CN" "$1" \
+              "${{ github.event_name }}" \
+              "${{ github.event.schedule || '-' }}" \
+              "$2" "$3" "$4" >> logs/runs.md
+          }
+
+          # 仓库主本人（单账号链路，结果沿用该步骤的 outcome）
+          append_row "self" "${{ steps.checkin.outcome || 'not-run' }}" "-" "${WB_CRED_SNAPSHOT:--}"
+
+          # 其他账号：读 wb_peers.py 落下的逐行结果（账号/结果/动作/提示/快照）。
+          # 文件不存在（未启用多账号、或上一步没能跑起来）时自动跳过。
+          if [ -s logs/last_run.tsv ]; then
+            while IFS="$(printf '\t')" read -r p_slug p_status p_action p_hint p_snap; do
+              [ -n "${p_slug:-}" ] || continue
+              append_row "${p_slug}" "${p_status}" \
+                "${p_action}${p_hint:+｜${p_hint}}" "${p_snap:--}"
+            done < logs/last_run.tsv
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # 只保留最近 200 条记录，避免文件无限增长
+          if [ "$(wc -l < logs/runs.md)" -gt 202 ]; then
+            head -2 logs/runs.md > /tmp/keep.txt
+            tail -200 logs/runs.md >> /tmp/keep.txt
+            mv /tmp/keep.txt logs/runs.md
+          fi
+
+          git add logs/runs.md
+          if git diff --cached --quiet; then
+            echo "运行记录无变化，跳过提交。"
+            exit 0
+          fi
+
+          git commit -m "chore: 记录运行 $(date -u '+%Y-%m-%d %H:%M') UTC [skip ci]"
+
+          # 本机凭据同步器会不定时往 main 推 state/credentials.enc，
+          # 与这里的提交是两条独立的写路径。直接 push 有一定概率被拒
+          # （2026-09-20 实测：签到成功但记录整条丢失，签到本身没问题，
+          #  只是「今天跑没跑」查不到了）。所以这里重试若干次，
+          # 每次先把本地提交 rebase 到最新 main 再推。
+          for i in 1 2 3 4 5; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "运行记录已提交（第 ${i} 次尝试）"
+              exit 0
+            fi
+            echo "::warning::第 ${i} 次推送被拒（多半与本机凭据同步提交撞车），重试中…"
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase "origin/${GITHUB_REF_NAME}" || { git rebase --abort || true; break; }
+            sleep $((i * 5))
+          done
+
+          # continue-on-error 会吞掉退出码，所以额外打一条 ::error:: 注解，
+          # 让「签到成功但记录没写进去」在 Actions 页面上可见。
+          echo "::error::运行记录推送连续失败，本次未写入仓库（签到步骤本身可能已成功，请以签到步骤日志为准）。"
+          exit 1
