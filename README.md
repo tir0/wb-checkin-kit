@@ -57,6 +57,10 @@ bash local/install.sh --notify 'https://oapi.dingtalk.com/robot/send?access_toke
 `--notify` 可省略。装完按脚本提示，去**你自己那个仓库**的 Settings 新建 Secret
 `WB_TOKEN_KEY`（密钥脚本已复制到剪贴板），保存即可。
 
+> 建好 Secret 之前，Actions 里会有一次红色运行 —— 那是正常的：任务会在
+> 「解出最新凭据」那步明确告诉你缺哪个 Secret。仓库里还没有凭据快照时，
+> 「记录运行结果」步骤会整体跳过，不会往仓库里写无意义的提交。
+
 > ⚠️ **你的仓库必须是私有的。** 工作流需要仓库里存一份「加密后的凭据快照」
 > （`state/credentials.enc`）。它本身不可解密，但一旦公开就会永久留在 git 历史里、
 > 收不回来 —— 哪天密钥泄露就等于凭据泄露。这也是这个仓库（你现在看的这个）

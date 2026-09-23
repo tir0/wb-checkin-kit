@@ -58,11 +58,14 @@ git init -q --bare --initial-branch=main "$PROBE/origin.git" || exit 1
 git clone -q "$PROBE/origin.git" "$PROBE/work" 2>/dev/null
 cd "$PROBE/work" || exit 1
 git config user.name t; git config user.email t@t
-mkdir -p logs
+mkdir -p logs state
 # 刻意用【旧的 6 列表头 + 一行旧数据】：既测抗撞车，也测表头升级时的行迁移
 # （只换表头不补列，历史行会整体错位，渲染成图时列会串）。
 printf '| 时间(UTC) | 北京时间 | 触发方式 | cron | 签到步骤 | 凭据快照 |\n|---|---|---|---|---|---|\n| 2026-09-20 05:58:29 | 2026-09-20 13:58 | schedule | 17 0 * * * | success | 2026-09-20T05:58:00Z |\n' \
   > logs/runs.md
+# 记录步骤有一道闸：仓库里没有凭据密文就整体跳过（分发/模板仓库不该写运行
+# 记录，见工作流备忘 16）。这里放一份假的，模拟真实部署仓库。
+printf 'Salted__not-a-real-ciphertext\n' > state/credentials.enc
 git add -A && git commit -q -m init && git push -q -u origin main
 # wb_peers.py 落下的多账号逐行结果（记录步骤读它）。
 # 刻意放在提交【之后】：该文件在真实仓库里被 .gitignore 排除，属运行时产物，
@@ -76,10 +79,11 @@ cd "$PROBE" || exit 1
 git clone -q "$PROBE/origin.git" "$PROBE/rival" 2>/dev/null
 cd "$PROBE/rival" || exit 1
 git config user.name r; git config user.email r@r
-mkdir -p state
-# 模拟同步器推凭据快照：改的是另一个文件，所以 rebase 不会冲突
-echo "snapshot-$(date +%s)" > state/credentials.enc
-git add -A && git commit -q -m "chore: 同步凭据快照 [skip ci]" && git push -q origin main
+mkdir -p state/peers
+# 模拟另一个写者先推了一个快照：改的是另一个文件，所以 rebase 不会冲突
+# （刻意避开 state/credentials.enc —— 那份在 work 里已存在，会撞车）
+echo "peer-snapshot-$(date +%s)" > state/peers/alice.enc
+git add -A && git commit -q -m "chore: 同步账号快照 [skip ci]" && git push -q origin main
 ok "竞争提交已推送（此时 work 落后远程 1 个提交）"
 
 echo "── 4) 执行记录步骤（预期：首次被拒 → 重试后成功）──"
@@ -108,10 +112,10 @@ cd "$PROBE" || exit 1
 git clone -q "$PROBE/origin.git" "$PROBE/verify" 2>/dev/null
 cd "$PROBE/verify" || exit 1
 has_commit "记录运行" && ok "远程已含「记录运行」提交" || bad "远程缺「记录运行」提交"
-[ -f state/credentials.enc ] && ok "竞争提交未被 rebase 弄丢" || bad "竞争提交丢失"
+[ -f state/peers/alice.enc ] && ok "竞争提交未被 rebase 弄丢" || bad "竞争提交丢失"
 LINES="$(grep -c '^| 2026-' logs/runs.md 2>/dev/null || echo 0)"
 [ "$LINES" -ge 1 ] && ok "runs.md 已追加记录（${LINES} 条）" || bad "runs.md 未追加记录"
-has_commit "同步凭据快照" && ok "两个写者的提交都在 main 上" || bad "历史被覆盖"
+has_commit "同步账号快照" && ok "两个写者的提交都在 main 上" || bad "历史被覆盖"
 
 echo "── 5b) 多账号行与旧行迁移 ──"
 head -1 logs/runs.md | grep -q "账号" \
@@ -130,6 +134,27 @@ grep -q 'auth_failed' logs/runs.md \
 git ls-files logs/ | grep -q last_run.tsv \
   && bad "last_run.tsv 被误提交了（应只入库 runs.md）" \
   || ok "last_run.tsv 未入库（运行时产物）"
+
+echo "── 5c) 分发/模板仓库：没有凭据密文时整体跳过 ──"
+# 公开分发仓库（wb-checkin-kit）是运行仓库的镜像，state/ 下的密文同步时被剔除。
+# 它自己的定时运行注定在「解出最新凭据」那步失败，此时不该再往公开仓库提交
+# 一行 "skipped"（2026-09-23 实测被提交了一行，见工作流备忘 16）。
+mkdir -p "$PROBE/kitlike"
+cd "$PROBE/kitlike" || exit 1
+git init -q --initial-branch=main .
+git config user.name k; git config user.email k@k
+printf '# 分发仓库\n' > README.md
+git add -A && git commit -q -m init
+: > "$PROBE/kit_summary.md"
+GITHUB_STEP_SUMMARY="$PROBE/kit_summary.md" /bin/bash "$PROBE/record.sh" \
+  > "$PROBE/kit.out" 2>&1
+RC=$?
+[ "$RC" = "0" ] && ok "跳过时退出码 0（不给镜像仓库染红）" || bad "退出码 ${RC}（期望 0）"
+grep -q "跳过运行记录" "$PROBE/kit.out" \
+  && ok "日志说明了为什么跳过" || bad "跳过原因没说清"
+[ ! -e logs/runs.md ] && ok "没有生成 logs/runs.md" || bad "仍然写了 runs.md"
+[ "$(git rev-list --count HEAD)" = "1" ] \
+  && ok "没有产生任何提交" || bad "产生了多余提交"
 
 echo
 printf '════ 结果：通过 %s 项，失败 %s 项 ════\n' "$pass" "$fail"
