@@ -95,14 +95,24 @@ name: WorkBuddy 每日自动签到
 #      因此坚持一人一钥，且快照里的 token 只有签到权限。
 #   14. 【多账号】新增/移除账号后必须更新 Secret WB_PEER_KEYS，否则新账号
 #      会因缺密钥被跳过（脚本会明确报出来，不会静默漏签）。
+#   15. 【通知】「每日回执」只在**本次运行真的签上了**（action=checked_in）时发，
+#      「今日已签到」(already_checked_in) 刻意不发。理由：cron 有 5 个时点，
+#      一天真正签上的只有第一次，后面 4 次都是同一份结论的重复播报 ——
+#      2026-09-23 按使用者反馈收紧了。判据定义在 wb_core.RECEIPT_ACTIONS，
+#      回归见 tests/test_notify.py 的 [1] 段。别把它加回成功集合。
 
 on:
   schedule:
-    # 三个时点整体前移，使「叠加约 4.5h 延迟后的实际执行」落在清晨至午后。
+    # 五个时点整体前移，使「叠加约 4.5h 延迟后的实际执行」落在清晨至夜间。
     # 换算：UTC = 北京时间 - 8h，跨天时向前借一天（故 04:17 北京 = 前一日 20:17 UTC）。
+    #
+    # 后两个时点是 2026-09-22 为「派喵喵去旅行」加的：喵喵派出后要等 1~4 小时
+    # 才可领取，靠多次运行才能覆盖到领取窗口。签到本身是幂等的，多跑几次无害。
     - cron: '17 20 * * *'     # 北京时间 04:17（主时点，次日）
     - cron: '17 0 * * *'      # 北京时间 08:17（兜底 1）
     - cron: '17 4 * * *'      # 北京时间 12:17（兜底 2）
+    - cron: '17 8 * * *'      # 北京时间 16:17（喵喵到达后领取）
+    - cron: '17 12 * * *'     # 北京时间 20:17（喵喵兜底领取）
   workflow_dispatch: {}       # 手动触发入口，用于验证
 
 permissions:
@@ -259,6 +269,38 @@ jobs:
           set -o pipefail
           python3 scripts/wb_peers.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # ── 派喵喵去旅行（2026-09-22 新增）──────────────────────────────────
+      # 与上面的签到链路【完全独立】：前两步一个字没改，本步骤出问题也不会
+      # 影响签到（反之亦然）。
+      #
+      # 本步骤是**幂等自检**，挂在任何频率的定时任务上都安全：
+      #     state=arrived                      → 领取奖励（5~10 积分）
+      #     state=idle 且今天还没派             → 随机挑个地点派出去（每天限一次）
+      #     state=traveling                    → 什么都不做，等下一次运行来领
+      #     state=idle 且今天已派过（已领完）    → 什么都不做
+      # 所以「派出 → 1~4 小时后领取」靠上面那几个 cron 时点自然闭环，
+      # 不需要长驻进程、也不需要 sleep 等着。
+      #
+      # 凭据复用上一步解密出来的 WB_ACCESS_TOKEN / WB_UID —— 同一个 token 在
+      # www.workbuddy.cn 与 copilot.tencent.com 两边都能用，因此**不需要新增 Secret**。
+      #
+      # ⚠️ 这里同样不要声明 NOTIFY_WEBHOOK：脚本读的是上一步写入 GITHUB_ENV 的值
+      #    （步骤级 env 优先级更高，声明一次就会把它覆盖成空）。
+      - name: 喵喵旅行
+        if: always()
+        id: travel
+        run: |
+          set -o pipefail
+          # 本步骤首次引入了另一个域名（签到用的是 copilot.tencent.com，
+          # 这里是 www.workbuddy.cn）。先探一下连通性并写进运行摘要：
+          # 万一海外 runner 被这个域名的调度拦掉，一眼就能看出是网络问题
+          # 而不是业务/凭据问题。预期看到 HTTP 401（无凭据访问被网关挡下 = 通）。
+          curl -s -o /dev/null -w 'www.workbuddy.cn 连通性：HTTP %{http_code}\n' \
+            --max-time 15 \
+            https://www.workbuddy.cn/activity/growth/buddy/travel/status \
+            >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          python3 scripts/wb_travel.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
       # 把本次运行追加到 logs/runs.md 并提交回仓库。
       # 目的：让「今天到底有没有自动跑」可以在仓库里直接查到，
       # 无需登录 Actions 页面；同时这些提交也算仓库活动。
@@ -312,6 +354,17 @@ jobs:
               append_row "${p_slug}" "${p_status}" \
                 "${p_action}${p_hint:+｜${p_hint}}" "${p_snap:--}"
             done < logs/last_run.tsv
+          fi
+
+          # 喵喵旅行：同一套列格式，但落在**独立文件**里 ——
+          # wb_peers.py 是覆盖写 last_run.tsv，两者共用一个文件的话，
+          # 谁后跑谁就把对方的行抹掉（步骤顺序一改就静默丢记录）。
+          if [ -s logs/travel.tsv ]; then
+            while IFS="$(printf '\t')" read -r t_slug t_status t_action t_hint t_snap; do
+              [ -n "${t_slug:-}" ] || continue
+              append_row "${t_slug}" "${t_status}" \
+                "${t_action}${t_hint:+｜${t_hint}}" "${t_snap:--}"
+            done < logs/travel.tsv
           fi
 
           git config user.name  'github-actions[bot]'

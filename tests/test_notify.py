@@ -101,9 +101,14 @@ def main():
         code, _, sent = run(tok, uid, 0, False, hook=hook)
         check(f"正常完成 exit={code} 且默认静默", code == 0 and not sent)
 
-        code, _, sent = run(tok, uid, 0, True, hook=hook,
-                            extra_env={"NOTIFY_ON_SUCCESS": "1"})
-        check("开启每日回执后正常完成也推送", code == 0 and sent)
+        # 真实链路上「该不该有回执」由本次的 action 决定，而 action 又取决于
+        # 今天是否已经签过 —— 所以这里不做固定预期，只断言两者一致：
+        # 本次签上了（checked_in）→ 有回执；今天早已签过（already_checked_in）→ 静默。
+        code, res, sent = run(tok, uid, 0, None, hook=hook,
+                              extra_env={"NOTIFY_ON_SUCCESS": "1"})
+        act = res.get("action", "")
+        check(f"回执与本次结局一致（{act}）",
+              code == 0 and sent == (act in ("checked_in", "inactive")), act)
 
         code, res, sent = run(tok, uid, 0, False, hook=hook,
                               extra_env={"NOTIFY_ON_SUCCESS": "1"}, status_only=True)
@@ -111,6 +116,36 @@ def main():
               code == 0 and not sent, res.get("action", ""))
     else:
         print("  · 跳过 3 项：需要本机登录态文件")
+
+    # ── 回执策略：只有「本次真的签上了」才发 ──────────────────────────────
+    # 合成 result 直接测这一层判定，不依赖真实接口当天返回什么。
+    # 背景：工作流一天跑 5 次（含喵喵旅行的领取窗口），若把「今日已签到」
+    # 也算作成功回执，同一句话会重复播报 4 遍。
+    print("\n[1b] 回执策略：已签到不重复播报")
+
+    def receipt(action, on_success):
+        RECV.clear()
+        if on_success is None:
+            os.environ.pop("NOTIFY_ON_SUCCESS", None)
+        else:
+            os.environ["NOTIFY_ON_SUCCESS"] = on_success
+        sent = wb_core.send_alert(0, {"action": action}, webhook=hook,
+                                  log=lambda m: None)
+        return sent, len(RECV) > 0
+
+    s, got = receipt("checked_in", "1")
+    check("本次签到成功 + 开回执 → 推一条", s and got)
+    s, got = receipt("already_checked_in", "1")
+    check("今日已签到 + 开回执 → 静默（不重复播报）", not s and not got)
+    s, got = receipt("inactive", "1")
+    check("活动未开放 + 开回执 → 照推（这个状态需要你知道）", s and got)
+    s, got = receipt("checked_in", None)
+    check("本次签到成功 + 未开回执 → 静默", not s and not got)
+    s, got = receipt("already_checked_in", None)
+    check("今日已签到 + 未开回执 → 静默", not s and not got)
+    s, got = receipt("auth_failed", None)
+    check("需要人工介入时无视开关，一律推", s and got)
+    os.environ.pop("NOTIFY_ON_SUCCESS", None)
 
     # 未配置 webhook 时应当完全静默（零侵入）
     code, _, sent = run("", "", 2, False, hook="")

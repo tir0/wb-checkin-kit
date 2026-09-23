@@ -201,12 +201,16 @@ python3 scripts/wb_peers.py --list       # 同上，直接看云端视角
 
 一个账号失败**不会**中断其他账号，但整体退出码非 0（会红），且通知里会指名是哪个账号。
 
+每日回执（`NOTIFY_ON_SUCCESS=1`）只在**本次运行真的签上了**时发一条；今天若早已签到
+完成，不会再催一遍 —— 定时任务一天跑 5 次，只有真正签上的那一条带新信息。
+
 ---
 
 ## 三、维护
 
 | 症状 | 处理 |
 |---|---|
+| 一天只收到一条回执，后面几次运行没动静 | 符合预期：只有真正签上的那次才发回执，已签到不重复播报 |
 | 自己没再收到回执 / 记录里出现 `auth_failed` | 本机同步器一般会自动恢复；必要时 `bash ~/.wb-checkin/wb-sync-credentials.sh --force` |
 | 某个朋友的账号 `auth_failed` | 让**他**重跑 `local/join.sh`（Windows 是 `join.ps1`），把新分享文件发回来，你再 `add-peer.sh` 导入 |
 | 朋友是 Windows，跑脚本报错 | 先让他跑 `-SelfTest`（自检，不碰凭据）；再检查 `-ExecutionPolicy Bypass` 是否带上、文件是否被「解除锁定」 |
@@ -240,10 +244,14 @@ bash    tests/test_peer_join.sh    # 「朋友加入 → 仓库主导入」全�
 bash    tests/test_peer_join_win.sh# 同上，Windows 侧（互操作 + 中文 Windows 兼容性）
 bash    tests/test_record_retry.sh # 运行记录抗撞车 + 旧表头行迁移
 bash    tests/test_sync_throttle.sh# 同步器节流与 git 状态自愈
+python3 tests/test_travel.py       # 喵喵旅行：幂等 / 状态机 / 竞态 / 通知策略 / 工作流接线
 ```
 
 `tests/test_record_retry.sh` 直接从工作流里抽出「记录运行结果」步骤来跑 ——
 所以改那段 bash 后，必须先跑它。
+
+`tests/test_travel.py` 的后半段是**静态断言**（工作流里的喵喵步骤、cron 数量、
+不重复声明 NOTIFY_WEBHOOK、记录步骤读 travel.tsv）—— 改那段接线后必须重跑。
 
 `tests/test_peer_join_win.sh` 的静态部分**永远执行**（BOM、GBK 无法显示的符号、
 与 openssl 对齐的算法参数、参数面）；端到端部分需要 PowerShell：本机没有 `pwsh`
@@ -259,10 +267,11 @@ WB_PWSH=/path/to/pwsh bash tests/test_peer_join_win.sh   # 指定别的可执行
 ## 六、目录
 
 ```
-.github/workflows/wb-checkin.yml   云端：解密 → 签到 → 多账号 → 记录
+.github/workflows/wb-checkin.yml   云端：解密 → 签到 → 多账号 → 喵喵旅行 → 记录
 scripts/wb_core.py                 核心逻辑（接口契约、判定、通知渲染，单一实现源）
 scripts/wb_checkin.py              单账号入口
 scripts/wb_peers.py                多账号驱动（每人一把密钥，逐个签到、分头发通知）
+scripts/wb_travel.py               喵喵旅行（幂等自检：该领就领、该派就派）
 local/install.sh                   本机安装（launchd + 密钥 + 配置）
 local/wb-sync-credentials.sh       本机凭据同步器（加密上传，带节流与锁兜底）
 local/join.sh                      他人账号侧：产出发给仓库主的分享文件（macOS/Linux）
@@ -272,6 +281,38 @@ local/add-peer.sh                  仓库主侧：导入分享文件、维护密
 state/                             加密凭据快照（入库；无密钥不可解）
 logs/runs.md                       逐账号运行记录（工作流自动追加）
 ```
+
+---
+
+## 七、附：派喵喵去旅行
+
+工作流里还挂了一个增长中心的小活动：每天可以把 Buddy（猫猫）派去一个地点旅行，
+随机 1~4 小时后到达，到达可领 5~10 积分，**每天限一次**。属于顺带跑的功能，
+不想要的话把工作流里的「喵喵旅行」步骤和 `scripts/wb_travel.py` 删掉即可，
+签到链路不受影响。
+
+自动化方式是**幂等自检**，不是「派完 sleep 四小时」：
+
+| 运行时的状态 | 动作 |
+|---|---|
+| `arrived`（已到达） | 领取奖励 |
+| `idle` 且今天还没派 | 随机挑个地点派出去 |
+| `traveling`（在路上） | 什么都不做，等下一次运行来领 |
+| `idle` 且今天已派过 | 什么都不做 |
+
+所以只需多两个 cron 时点（16:17 / 20:17 北京）—— 上午那次把猫派出去，
+之后任意一次运行时若已到达就自动领取。每次运行都是安全的：
+重复跑不会重复领、也不会重复派。
+
+凭据与签到**同源**：同一个 accessToken 在 `www.workbuddy.cn` 与
+`copilot.tencent.com` 两边都能用，因此**不需要任何新的 Secret**。
+
+```bash
+python3 scripts/wb_travel.py --status-only   # 看一眼状态（只读，不影响活动）
+python3 scripts/wb_travel.py                 # 手动跑一次完整自检
+```
+
+通知也只共用同一个机器人：只在「领取成功」和「需要人工介入」时推送。
 
 ---
 

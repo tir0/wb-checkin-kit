@@ -191,10 +191,15 @@ NOTIFY_TIMEOUT = 8
 # 与 NOTIFY_ON_SUCCESS 无关，一律推送。
 ALERT_ACTIONS = ("auth_failed", "missing_credentials", "failed", "network_error")
 
-# 这几种属于「正常完成」。默认静默，否则每天一条就成了骚扰；
-# 设 NOTIFY_ON_SUCCESS=1 后它们也会推送，相当于每日回执。
-# 刻意不含 status_only：那是本地调试模式，不该产生通知。
-SUCCESS_ACTIONS = ("checked_in", "already_checked_in", "inactive")
+# 每日回执（设 NOTIFY_ON_SUCCESS=1 后生效）只在这两种结局发：
+#   checked_in —— 本次运行真的把签到做掉了，回执里的连续天数/积分才是新数据
+#   inactive   —— 活动未开放，属于「自动化此刻做不了事」的状态，值得你知道
+# 刻意排除 already_checked_in（今日已签到）：它是「已经报过的那一次」派生出的
+# 同一份结论 —— 本工作流一天要跑 5 次（含喵喵旅行的领取窗口，见 wb-checkin.yml），
+# 收进来就会把同一句话重复播报 4 遍。回执的价值在「我替你签上了」，
+# 不在「我知道你已经签过了」。
+# 同样刻意不含 status_only：那是本地调试模式，不该产生通知。
+RECEIPT_ACTIONS = ("checked_in", "inactive")
 
 _NOTIFY_TITLES = {
     "auth_failed": "凭据已失效",
@@ -371,11 +376,15 @@ def _notify_delivered(body) -> tuple:
     return True, ""
 
 
-def send_alert(exit_code, result, webhook=None, log=None) -> bool:
-    """按需发送通知。返回是否真的发出去了。
+def deliver(title: str, text: str, webhook=None, log=None) -> bool:
+    """把一条已渲染好的通知按渠道格式发出去。返回是否真的送达。
+
+    这是通知链路的**唯一发送实现**：渠道适配（企业微信/钉钉、Server 酱、
+    通用 JSON）与「HTTP 200 却被渠道拒收」的判定都只此一处，
+    签到（send_alert）与喵喵旅行（scripts/wb_travel.py）共用，避免两份漂移。
 
     刻意做成「永不抛异常、也永不改变退出码」：通知只是附加信息通道，
-    它坏了不该让签到任务看起来失败，也不该掩盖真实结果。
+    它坏了不该让任务看起来失败，也不该掩盖真实结论。
     """
     log = log or make_logger()
     if webhook is None:
@@ -384,19 +393,10 @@ def send_alert(exit_code, result, webhook=None, log=None) -> bool:
     if not webhook:
         return False
 
-    action = (result or {}).get("action")
-    if action in ALERT_ACTIONS:
-        pass  # 需要人工介入，无论开关如何都要推送
-    elif action in SUCCESS_ACTIONS and _truthy(os.environ.get(NOTIFY_ON_SUCCESS_ENV)):
-        pass  # 正常完成 + 已开启每日回执
-    else:
-        return False
-
     if urllib.parse.urlparse(webhook).scheme not in ("http", "https"):
         log("通知未发送：NOTIFY_WEBHOOK 必须是 http(s) 地址。")
         return False
 
-    title, text = render_alert(exit_code, result)
     kind = _notify_kind(webhook)
 
     def _send():
@@ -421,6 +421,32 @@ def send_alert(exit_code, result, webhook=None, log=None) -> bool:
         return False
     log(f"通知已发送（{kind}，HTTP {code}）：{snippet}")
     return True
+
+
+def send_alert(exit_code, result, webhook=None, log=None) -> bool:
+    """按需发送通知。返回是否真的发出去了。
+
+    只负责判断「该不该发」并渲染正文；实际发送交给 deliver()。
+    刻意做成「永不抛异常、也永不改变退出码」：通知只是附加信息通道，
+    它坏了不该让签到任务看起来失败，也不该掩盖真实结果。
+    """
+    log = log or make_logger()
+    if webhook is None:
+        webhook = os.environ.get(NOTIFY_WEBHOOK_ENV, "")
+    webhook = (webhook or "").strip()
+    if not webhook:
+        return False
+
+    action = (result or {}).get("action")
+    if action in ALERT_ACTIONS:
+        pass  # 需要人工介入，无论开关如何都要推送
+    elif action in RECEIPT_ACTIONS and _truthy(os.environ.get(NOTIFY_ON_SUCCESS_ENV)):
+        pass  # 真有进展（本次签到完成 / 活动状态变化）+ 已开启每日回执
+    else:
+        return False
+
+    title, text = render_alert(exit_code, result)
+    return deliver(title, text, webhook=webhook, log=log)
 
 
 def checkin(token: str, uid: str, status_only: bool = False, log=None, notify=None):
