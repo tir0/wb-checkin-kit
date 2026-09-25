@@ -81,6 +81,35 @@ chmod 700 "$STATE_DIR"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"; }
 
+# 告警出口。同步器的失败大多是静默的（launchd 后台跑、没人看日志），
+# 而此时 Workflow 侧的签到链路还没拿到凭据、还没到能发通知的那一步 ——
+# 于是「最需要通知的场景恰好没有通知」。这里的机器人地址成了唯一可用通道。
+#
+# 刻意做成「永不改变退出码、失败也只是一行日志」：通知是旁挂载荷，
+# 它坏了不该把真正的失败原因掩盖掉。
+# 渠道形态与 scripts/wb_core.py 保持一致（钉钉/企微/Server酱/通用 JSON）。
+notify() {
+  _hook="$1"; _title="$2"; _text="$3"
+  [ -n "$_hook" ] || { log "  （未配置通知渠道，告警只写日志）"; return 0; }
+  case "$_hook" in
+    *qyapi.weixin.qq.com*)
+      _body="$(printf '{"msgtype":"text","text":{"content":"%s\n%s"}}' "$_title" "$_text")" ;;
+    *sctapi.ftqq.com*|*sc.ftqq.com*)
+      _body="" ;;
+    *)
+      _body="$(printf '{"text":"%s\n%s"}' "$_title" "$_text")" ;;
+  esac
+  if [ -n "$_body" ]; then
+    curl -s -m 10 --noproxy '*' -o /dev/null \
+      -H 'Content-Type: application/json' -d "$_body" "$_hook" 2>/dev/null \
+      || log "  （告警发送失败，详见 sync.log）"
+  else
+    curl -s -m 10 --noproxy '*' -o /dev/null \
+      --data-urlencode "title=$_title" --data-urlencode "desp=$_text" "$_hook" 2>/dev/null \
+      || log "  （告警发送失败，详见 sync.log）"
+  fi
+}
+
 if [ -f "$LOG_FILE" ] && [ "$(wc -c <"$LOG_FILE")" -gt 1048576 ]; then
   tail -300 "$LOG_FILE" >"$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
@@ -112,6 +141,46 @@ if [ -z "$ACCESS_TOKEN" ] || [ -z "$WB_UID" ] || [ "$ACCESS_TOKEN" = "null" ]; t
   log "凭据文件里没有可用的 accessToken / uid，跳过"
   exit 4
 fi
+
+# ── 1.5) 凭据形态闸门（2026-09-25 事故后新增，别删）──────────────────────
+# 桌面端从 2026-09-23 起对凭据文件启用了静态加密（At-Rest Encryption,
+# policy=fields）。此后 .auth.accessToken 不再是 JWT 明文，而是一个封套：
+#     { "$wbEncrypted": 1, "envelope": "<base64>" }
+# 解开它用的对称保护密钥由 daemon 启动时与服务端握手获得，只存在于进程内存，
+# 本机离线无法还原 —— 也就是说这条抓取明文 token 的路被产品侧关闭了。
+#
+# jq -r '.auth.accessToken' 会把这个**对象**序列化成带换行的 JSON 字符串。
+# 若照样加密推上去，会接连造成两个后果：
+#   ① 云端拿它当 Bearer 用 → 401（不可用的凭据覆盖了仍在生效的旧快照）；
+#   ② 更隐蔽：它是多行的，写入 GITHUB_ENV 时 GitHub 判 "Invalid format"，
+#      「解出最新凭据」整步失败 → 签到步骤被 skip，runs.md 里只留下一行
+#      skipped —— 表现就是连续两天静默不签到（2026-09-23 22:59 起 6 次全 skipped）。
+#
+# 所以这里必须 fail-fast：保留远端上一份可用快照，绝不拿不可用凭据去覆盖，
+# 并通过当时唯一还能触达用户的通道（通知机器人）明确告警。
+case "$ACCESS_TOKEN" in
+  *wbEncrypted*|*envelope*|'{'*)
+    log "凭据已被桌面端加密（At-Rest）：无法读取明文 token，本次不推送"
+    log "  原因：$CRED_FILE 中 .auth.accessToken 是加密封套，密钥只在 daemon 内存里"
+    log "  影响：云端继续沿用远端上一份快照，直到它过期为止"
+    notify "$NOTIFY_WEBHOOK" "WorkBuddy 签到：凭据已被桌面端加密，自动签到将失效" \
+      "桌面端启用了凭据静态加密，同步器读不到明文 token。
+云端会沿用上一份快照直到其过期。
+原因：$(basename "$CRED_FILE") 中 accessToken 为加密封套，密钥只在进程内存中。
+详见 ~/.wb-checkin/sync.log"
+    exit 14 ;;
+esac
+
+# 顺带的形态检查：JWT 与旧式不透明串都不含空白字符。一旦出现空白，必然是
+# 多行的 JSON（见上）或被意外截断 —— 推上去同样会让 GITHUB_ENV 写入失败。
+case "$ACCESS_TOKEN" in
+  *[![:graph:]]*)
+    log "凭据形态异常（含空白字符），拒绝推送以免破坏云端 GITHUB_ENV 注入"
+    notify "$NOTIFY_WEBHOOK" "WorkBuddy 签到：本机凭据形态异常" \
+      "accessToken 含空白字符，推送已中止（保留云端上一份快照）。
+详见 ~/.wb-checkin/sync.log"
+    exit 14 ;;
+esac
 
 NEW_HASH="$(printf '%s\n%s' "$ACCESS_TOKEN" "$WB_UID" | shasum -a 256 | awk '{print $1}')"
 
@@ -263,14 +332,25 @@ HTTP_CODE="$(curl -s -m 15 --noproxy '*' -o /dev/null -w '%{http_code}' \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "X-User-Id: $WB_UID" \
   -H 'Content-Type: application/json' -H 'Accept: application/json' \
-  -d '{}' 2>/dev/null || echo "000")"
+  -d '{}' 2>/dev/null)"
+# curl 连不上时 -w 已经会输出 000，这里只需吞掉非零退出码。
+# （早先写成 `|| echo "000"` 导致日志里出现 HTTP=000000 这种看不懂的值。）
 
 if [ "$HTTP_CODE" = "401" ]; then
   log "本机凭据已被服务端拒绝（401），不推送。桌面端重新登录后本脚本会自动恢复。"
   exit 5
 fi
+# 走到这一支说明 curl 根本没连上（000 = 连接失败/超时），不是凭据本身被拒。
+# 原写法「仍继续推送以免误判」在 2026-09-25 出了事：网络抖动期间恰好撞上桌面端
+# 凭据格式换代，于是把不可用凭据推进了仓库，覆盖掉了仍然生效的旧快照。
+# 校准原则：**未知的凭据不要推**。远端那份 JWT 通常还有几十天有效期，
+# 少更新一次无损可用性；推错了则直接让云端连续失败且不好回滚。
 if [ "$HTTP_CODE" != "200" ]; then
-  log "凭据校验未返回 200（HTTP=${HTTP_CODE}，可能是网络问题），仍继续推送以免误判。"
+  log "凭据可用性无法确认（HTTP=${HTTP_CODE}，连接失败/超时），本次不推送。"
+  log "  判据：只有显式 401 才是「凭据已被服务端拒绝」的确定结论；"
+  log "        探测失败只说明这次没能连通，不代表凭据失效。"
+  log "  影响：远端继续沿用上一份快照；网络恢复后本脚本会自动重试。"
+  exit 15
 fi
 
 # ---------- 6) 加密 ----------

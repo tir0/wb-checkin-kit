@@ -213,6 +213,43 @@ def main():
           re.search(r'if ! git -C "\$WORK_DIR" checkout -q -f -B', courier_src) is not None)
     check("推送全败时不写指纹（保证下轮重试）", "指纹未更新" in courier_src)
 
+    # ── [6] 凭据形态闸门（2026-09-25 事故，别删这些断言）────────────────
+    # 桌面端 2026-09-23 起对凭据文件启用静态加密：.auth.accessToken 变成
+    # {"$wbEncrypted":1,"envelope":...} 封套，明文只在 daemon 内存中。
+    # jq -r 会把这个对象序列化成**多行 JSON**，被当成 token 推上去后：
+    #   ① 云端当 Bearer 用 → 401（不可用凭据覆盖掉仍在生效的快照）
+    #   ② 更隐蔽：多行值写 GITHUB_ENV → "Invalid format" → 解密步骤整步失败
+    #      → 签到步骤被 skip → 连续 6 次运行 skipped，静默两天没签到
+    print("\n[6] 凭据形态闸门与「未知凭据不推」")
+    check("同步器识别出加密封套（wbEncrypted）", "wbEncrypted" in courier_src)
+    check("同步器识别出对象形态（以 { 开头）", "'{'*)" in courier_src)
+    check("封套凭据以独立退出码 14 中止",
+          "exit 14" in courier_src)
+    check("含空白字符的凭据同样被拒（否则破坏 GITHUB_ENV 注入）",
+          "*[![:graph:]]*)" in courier_src)
+    check("闸门路径会主动告警（否则用户无从察觉静默失效）",
+          "notify " in courier_src and '"$NOTIFY_WEBHOOK"' in courier_src)
+    check("告警通道覆盖三种渠道形态（钉钉/企微/Server酱）",
+          "qyapi.weixin.qq.com" in courier_src and "data-urlencode" in courier_src)
+    # 早先的写法：curl 探测失败（HTTP 000）也「继续推送以免误判」。
+    # 2026-09-25 就是这个分支在夜晚网络抖动时把坏凭据推进了仓库。
+    # 只判**代码**：上面解释事故的注释里也会提到这些字符串，
+    # 连注释一起 grep 会让断言恒真（注释换个说法就漏过去了）。
+    def code_only(src):
+        return "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+
+    courier_code = code_only(courier_src)
+    check("不再出现「HTTP 探测失败仍继续推送」的有害写法",
+          "仍继续推送以免误判" not in courier_code)
+    check("探测连不上时不推送（退出码 15），保留远端旧快照",
+          "exit 15" in courier_code)
+    check("http_code 不再被重复拼接成看不懂的 000000",
+          '|| echo "000"' not in courier_code)
+    check("云端解密步骤也做了同样的形态校验（防止防线单点）",
+          "'{'*|*wbEncrypted*|*[![:graph:]]*)" in workflow_src)
+    check("云端形态不合法时给出可读的排查指引",
+          "tail -20 ~/.wb-checkin/sync.log" in workflow_src)
+
     # 2026-09-20 实测：签到成功但 logs/runs.md 没有当天记录 —— 本机同步器
     # 的提交与工作流的提交撞车，push 被拒，而该步骤 continue-on-error
     # 把失败静默吞掉。现在必须有重试 + 可见的 ::error::。

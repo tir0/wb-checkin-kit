@@ -59,7 +59,12 @@ def load_creds():
                 continue
             tok = (d.get("auth") or {}).get("accessToken")
             uid = (d.get("account") or {}).get("uid")
-            if tok and uid:
+            # 凭据文件的形态会随桌面端升级变化：2026-09-23 起桌面端启用了静态
+            # 加密，accessToken 从明文 JWT 变成了 {"$wbEncrypted":1,"envelope":...}
+            # 封套对象。此时没有可读的明文 token，等价于「本机没有登录态」，
+            # 应当让依赖真实凭据的用例走跳过分支 —— 而不是把 dict 塞给
+            # 后续的字符串操作，让测试以 TypeError 的方式炸掉。
+            if isinstance(tok, str) and uid:
                 return tok, str(uid)
     return None, None
 

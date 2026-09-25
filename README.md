@@ -220,6 +220,8 @@ python3 scripts/wb_peers.py --list       # 同上，直接看云端视角
 | 朋友是 Windows，跑脚本报错 | 先让他跑 `-SelfTest`（自检，不碰凭据）；再检查 `-ExecutionPolicy Bypass` 是否带上、文件是否被「解除锁定」 |
 | 新增/移除账号后不生效 | 忘了更新 Secret `WB_PEER_KEYS`（缺密钥的账号会被明确跳过，不会静默漏签） |
 | 改了 `local/` 下的脚本 | 重跑 `bash local/install.sh` —— launchd 跑的是 `~/.wb-checkin/` 下的副本 |
+| 记录里连续出现 `skipped`（签到步骤从未运行） | 「解出最新凭据」那步失败了 → 后面的签到必然被 skip。看该步骤日志定位是哪一类（缺 Secret / 密文损坏 / 凭据形态不可用） |
+| 同步器日志出现「凭据已被桌面端加密」 | 桌面端启用了静态加密（2026-09-23 起），本机读不到明文 token。同步器会**停推**（退出码 14）并告警，云端沿用上一份快照直到过期 |
 | 本地仓库没跟上云端提交 | 本机工作副本不会自动跟随（launchd 无权访问 `~/Documents`），自己 `git pull` |
 
 ---
